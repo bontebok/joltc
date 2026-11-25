@@ -4,12 +4,16 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - 'main'
+      - '**'
     paths-ignore:
-      - '*.md'
+      - '**/*.md'
   pull_request:
     paths-ignore:
-      - '*.md'
+      - '**/*.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows:
@@ -159,7 +163,7 @@ jobs:
         -DCMAKE_TOOLCHAIN_FILE="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
         -DCMAKE_INSTALL_PREFIX:String="SDK"
         -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
-    - name: Build (android-armeabi-v7a)
+    - name: Build (android-x86_64)
       run: cmake --build build_android_x86_64 --config Distribution --verbose --parallel
 
     - name: CMake Configure (android-arm64-v8a) Debug
@@ -195,7 +199,7 @@ jobs:
         -DCMAKE_TOOLCHAIN_FILE="${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake"
         -DCMAKE_INSTALL_PREFIX:String="SDK"
         -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
-    - name: Build (android-armeabi-v7a) Debug
+    - name: Build (android-x86_64) Debug
       run: cmake --build build_android_x86_64 --config Debug --verbose --parallel
 
     # Linux and Android artifacts
@@ -279,12 +283,6 @@ jobs:
       - uses: edgarrc/action-7z@v1
         with:
           args: 7z a -t7z jolt_libs.7z ./jolt_libs/
-
-      - uses: AButler/upload-release-assets@v2.0
-        if: github.event_name == 'release' && github.event.action == 'created'
-        with:
-          files: jolt_libs.zip
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/upload-artifact@v7
         with:
