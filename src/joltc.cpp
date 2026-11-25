@@ -84,6 +84,7 @@ JPH_SUPPRESS_WARNINGS
 #include <cstdio>
 #include <cstdarg>
 #include <algorithm>
+#include <mutex>
 
 // All Jolt symbols are in the JPH namespace
 using namespace JPH;
@@ -232,6 +233,7 @@ DEF_MAP_DECL(SoftBodyMotionProperties, JPH_SoftBodyMotionProperties)
 DEF_MAP_DECL(SoftBodyManifold, JPH_SoftBodyManifold)
 
 // Callback for traces, connect this to your own trace function if you have one
+// Threading contract: set once (JPH_SetTraceHandler) before use; read without a lock.
 static JPH_TraceFunc s_TraceFunc = nullptr;
 
 static void TraceImpl(const char* fmt, ...)
@@ -257,6 +259,7 @@ static void TraceImpl(const char* fmt, ...)
 }
 
 #ifdef JPH_ENABLE_ASSERTS
+// Threading contract: set once (JPH_SetAssertFailureHandler) before use; read without a lock.
 static JPH_AssertFailureFunc s_AssertFailureFunc = nullptr;
 
 // Callback for asserts, connect this to your own assert handler if you have one
@@ -681,6 +684,10 @@ static JPH::IndexedTriangle ToIndexedTriangle(const JPH_IndexedTriangle& triangl
 
 // 10 MB was not enough for large simulation, let's use TempAllocatorMalloc
 static bool s_initialized = false;
+static std::mutex s_InitMutex; // Serializes JPH_Init/JPH_Shutdown. Never hold together with s_PhysicsSystemsMutex.
+// Threading contract: s_TempAllocator is read without a lock. JPH_Shutdown must not run while
+// callers are using it. It is a single shared stack allocator, so concurrent
+// JPH_PhysicsSystem_Update calls on different systems are not covered by this change.
 static TempAllocator* s_TempAllocator = nullptr;
 
 class JobSystemCallback final : public JPH::JobSystemWithBarrier
@@ -798,6 +805,8 @@ void JPH_JobSystem_Destroy(JPH_JobSystem* jobSystem)
 
 bool JPH_Init()
 {
+	std::lock_guard<std::mutex> lock(s_InitMutex);
+
 	if (s_initialized)
 		return true;
 
@@ -829,6 +838,8 @@ bool JPH_Init()
 
 void JPH_Shutdown(void)
 {
+	std::lock_guard<std::mutex> lock(s_InitMutex);
+
 	if (!s_initialized)
 		return;
 
@@ -1035,6 +1046,30 @@ struct JPH_PhysicsSystem final
 	JPH::PhysicsSystem* physicsSystem = nullptr;
 };
 static JPH::UnorderedMap<JPH::PhysicsSystem*, JPH_PhysicsSystem*> s_PhysicsSystems;
+// Guards the s_PhysicsSystems map only (insert in Create, erase in Destroy, lookup in
+// ManagedPhysicsStepListener::OnStep). Never hold across Init, delete, or callbacks.
+// It makes the map itself safe for concurrent Create/Destroy/step from different threads.
+// It does not make a single PhysicsSystem safe to destroy while it is being stepped.
+static std::mutex s_PhysicsSystemsMutex;
+
+static void RegisterPhysicsSystem(JPH::PhysicsSystem* key, JPH_PhysicsSystem* wrapper)
+{
+	std::lock_guard<std::mutex> lock(s_PhysicsSystemsMutex);
+	s_PhysicsSystems[key] = wrapper;
+}
+
+static void UnregisterPhysicsSystem(JPH::PhysicsSystem* key)
+{
+	std::lock_guard<std::mutex> lock(s_PhysicsSystemsMutex);
+	s_PhysicsSystems.erase(key);
+}
+
+static JPH_PhysicsSystem* FindPhysicsSystem(JPH::PhysicsSystem* key)
+{
+	std::lock_guard<std::mutex> lock(s_PhysicsSystemsMutex);
+	auto it = s_PhysicsSystems.find(key);
+	return it != s_PhysicsSystems.end() ? it->second : nullptr;
+}
 
 JPH_PhysicsSystem* JPH_PhysicsSystem_Create(const JPH_PhysicsSystemSettings* settings)
 {
@@ -1059,7 +1094,7 @@ JPH_PhysicsSystem* JPH_PhysicsSystem_Create(const JPH_PhysicsSystemSettings* set
 	system->physicsSystem->GetBroadPhaseLayerInterface();
 
 
-	s_PhysicsSystems[system->physicsSystem] = system;
+	RegisterPhysicsSystem(system->physicsSystem, system);
 	return system;
 }
 
@@ -1067,7 +1102,7 @@ void JPH_PhysicsSystem_Destroy(JPH_PhysicsSystem* system)
 {
 	if (system)
 	{
-		s_PhysicsSystems.erase(system->physicsSystem);
+		UnregisterPhysicsSystem(system->physicsSystem);
 
 		system->physicsSystem->SetContactListener(nullptr);
 		system->physicsSystem->SetBodyActivationListener(nullptr);
@@ -5547,6 +5582,8 @@ void JPH_PhysicsSystem_DrawConstraintReferenceFrame(JPH_PhysicsSystem* system, J
 class ManagedPhysicsStepListener final : public JPH::PhysicsStepListener
 {
 public:
+	// Threading contract: like every per-class s_Procs pointer in this file, it is set once
+	// (JPH_PhysicsStepListener_SetProcs) before use and read without a lock afterwards.
 	static const JPH_PhysicsStepListener_Procs* s_Procs;
 	void* userData = nullptr;
 
@@ -5565,7 +5602,7 @@ public:
 			context.deltaTime = inContext.mDeltaTime;
 			context.isFirstStep = inContext.mIsFirstStep;
 			context.isLastStep = inContext.mIsLastStep;
-			context.physicsSystem = s_PhysicsSystems[inContext.mPhysicsSystem];
+			context.physicsSystem = FindPhysicsSystem(inContext.mPhysicsSystem);
 			return s_Procs->OnStep(userData, &context);
 		}
 	}
